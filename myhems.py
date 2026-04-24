@@ -1,6 +1,7 @@
 """
-myhems v0.5.3
-- "Standort" aus Dashboard-Header entfernt
+myhems v0.5.4
+- Config automatisch per Hostname geladen (configs/config_<hostname>.yaml)
+- config.yaml als Fallback
 """
 
 import time
@@ -15,7 +16,7 @@ import requests
 import yaml
 from flask import Flask, jsonify, render_template_string
 
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,14 +28,25 @@ log = logging.getLogger("myhems")
 # ─── KONFIGURATION ──────────────────────────────────────────────────────────
 
 def lade_config():
-    pfad = os.path.join(os.path.dirname(__file__), "config.yaml")
-    if not os.path.exists(pfad):
-        log.error(f"config.yaml nicht gefunden: {pfad}")
-        sys.exit(1)
-    with open(pfad) as f:
-        cfg = yaml.safe_load(f)
-    log.info(f"Konfiguration geladen: Standort '{cfg['standort']['name']}'")
-    return cfg
+    basis = os.path.dirname(__file__)
+    hostname = socket.gethostname()  # z.B. "hemsbox-udo"
+    # Hostname-Teil nach "-" extrahieren: "hemsbox-udo" → "udo"
+    teil = hostname.split("-")[-1] if "-" in hostname else hostname
+
+    # Suche: configs/config_<teil>.yaml → config.yaml
+    kandidaten = [
+        os.path.join(basis, "configs", f"config_{teil}.yaml"),
+        os.path.join(basis, "config.yaml"),
+    ]
+    for pfad in kandidaten:
+        if os.path.exists(pfad):
+            with open(pfad) as f:
+                cfg = yaml.safe_load(f)
+            log.info(f"Config geladen: {pfad} (Standort: '{cfg['standort']['name']}')")
+            return cfg
+
+    log.error(f"Keine Config gefunden. Gesucht: {kandidaten}")
+    sys.exit(1)
 
 CFG = lade_config()
 
@@ -377,7 +389,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 <div class="wrapper">
 <div class="header">
-  <!-- Logo -->
   <svg width="160" height="68" viewBox="0 0 420 200" xmlns="http://www.w3.org/2000/svg">
     <rect x="30"  y="130" width="11" height="20" rx="2" fill="#38bdf8" opacity="0.20"/>
     <rect x="44"  y="115" width="11" height="35" rx="2" fill="#38bdf8" opacity="0.38"/>
@@ -402,13 +413,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <text x="174" y="150" font-family="Syncopate,sans-serif" font-size="46" font-weight="700" fill="#e0f2fe" letter-spacing="3">HEMS</text>
     <text x="178" y="168" font-family="Share Tech Mono,monospace" font-size="7" fill="#1e3a5f" letter-spacing="3">HOME ENERGY MGMT SYS</text>
   </svg>
-  <!-- Standortname + Titel -->
   <div style="margin-left:12px;">
     <div class="syn" style="font-size:7px;color:var(--cyan);letter-spacing:5px;margin-bottom:4px;">MYHEMS · {{ standort|upper }}</div>
     <div class="syn" style="font-size:15px;font-weight:700;letter-spacing:4px;">ENERGIE DASHBOARD</div>
     <div class="syn" style="font-size:7px;color:var(--dim);letter-spacing:2px;margin-top:2px;" id="version">v—</div>
   </div>
-  <!-- Online Status -->
   <div style="text-align:right;margin-left:auto;">
     <div class="dot" id="dot"></div>
     <div class="syn" style="font-size:7px;color:var(--cyan);margin-top:2px;letter-spacing:2px;">ONLINE</div>
@@ -416,7 +425,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <div class="content">
-  <!-- Heizstab -->
   <div class="card">
     <div class="twarn" id="twarn" style="display:none;">
       <div class="twarn-dot"></div>
@@ -432,7 +440,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- SOC -->
   <div class="card">
     <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
       <div class="syn lbl">BATTERIE LADESTAND</div>
@@ -445,7 +452,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="syn" style="font-size:7px;color:var(--dim);margin-top:4px;letter-spacing:2px;">MINDESTWERT {{ min_soc }} %</div>
   </div>
 
-  <!-- Messkarten -->
   <div class="grid">
     <div class="card">
       <div class="syn lbl">PV ERZEUGUNG</div>
@@ -468,7 +474,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Regelstatus -->
   <div class="card">
     <div class="syn lbl" style="margin-bottom:10px;">BEDINGUNGEN</div>
     <div class="bed" id="bedSOC"><span class="bl syn">—</span><span class="bv">—</span></div>
@@ -490,7 +495,6 @@ function bed(id,ok,lbl,val){
   e.className="bed "+(ok?"ok":"fail");
   e.innerHTML=`<span class="bl syn">${ok?"✓":"✗"} ${lbl}</span><span class="bv">${val}</span>`;
 }
-
 function baueRelaisDots(relaisLeistung, relaisZustand) {
   const c = document.getElementById("relaisDots");
   c.innerHTML = "";
@@ -505,22 +509,18 @@ function baueRelaisDots(relaisLeistung, relaisZustand) {
     </div>`;
   });
 }
-
 async function update(){
   try{
     const d = await(await fetch("/api/status")).json();
     document.getElementById("dot").className="dot";
     document.getElementById("version").textContent="v"+d.version;
-
     const w = d.heizstab_w || 0;
     const relais = d.relais || [];
     const aktiv = relais.filter(Boolean).length;
     document.getElementById("heizLabel").textContent = w===0 ? "AUS" : (w/1000).toFixed(1)+" kW";
     document.getElementById("heizSub").textContent = w>0 ? aktiv+" RELAIS AKTIV" : "KEIN HEIZSTAB";
     baueRelaisDots(d.relais_leistung || [], relais);
-
     document.getElementById("twarn").style.display = d.thermostat_aus ? "flex" : "none";
-
     const soc = d.soc;
     const sc=document.getElementById("socVal"), sb=document.getElementById("socBar");
     if(soc!=null){
@@ -528,29 +528,23 @@ async function update(){
       sc.textContent=Math.round(soc)+" %";sc.style.color=c;
       sb.style.width=soc+"%";sb.style.background=c;
     } else {sc.textContent="n/v";sc.style.color="#4b5563";sb.style.width="0%";}
-
     document.getElementById("pvVal").textContent=fmtAbs(d.pv);
-
     const m=d.marstek||0, mc=m>0?"#818cf8":m<0?"#f87171":"#4b5563";
     document.getElementById("marstekVal").textContent=fmt(d.marstek);
     document.getElementById("marstekVal").style.color=mc;
     document.getElementById("marstekSub").textContent=m>0?"LÄDT":m<0?"ENTLÄDT":"IDLE";
     document.getElementById("marstekSub").style.color=mc;
-
     const n=d.netz||0, nc=n<0?"#22c55e":n>0?"#ef4444":"#4b5563";
     document.getElementById("netzVal").textContent=fmt(d.netz);
     document.getElementById("netzVal").style.color=nc;
     document.getElementById("netzSub").textContent=n<0?"EINSPEISUNG":n>0?"NETZBEZUG":"AUSGEGLICHEN";
     document.getElementById("netzSub").style.color=nc;
-
     document.getElementById("eigenVal").textContent=fmtAbs(d.hausverbrauch);
-
     const p=d.params;
     bed("bedSOC",d.soc==null||d.soc>=p.MIN_SOC,"LADESTAND ≥ "+p.MIN_SOC+" %",d.soc!=null?Math.round(d.soc)+" %":"n/v");
     bed("bedLade",(d.marstek||0)>p.LADE_SCHWELLE||(d.netz||0)<-p.LADE_SCHWELLE,
       "ÜBERSCHUSS > "+p.LADE_SCHWELLE.toLocaleString("de-DE")+" W",
       fmt(d.marstek));
-
     const rt=document.getElementById("regeltext");
     rt.textContent=d.regeltext; rt.className="regeltext "+(d.regeltyp||"");
     document.getElementById("ts").textContent="LETZTE AKTUALISIERUNG · "+new Date(d.timestamp*1000).toLocaleTimeString("de-DE");

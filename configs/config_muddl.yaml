@@ -1,0 +1,30 @@
+standort:
+  name: Muddl
+  domain: muddl.myhems.org
+geraete:
+  shelly_pv:
+    ip: "192.168.178.122"
+    typ: "EM1"
+  shelly_netz:
+    ip: "192.168.178.62"
+    typ: "EM"
+  shelly_marstek:
+    ip: "192.168.178.183"
+    typ: "Switch"
+  shelly_heizstab:
+    - ip: "192.168.178.97"
+    - ip: "192.168.178.81"
+    - ip: "192.168.178.25"
+  marstek_ip:   "192.168.178.181"
+  marstek_port: 30000
+heizstab:
+  relais: [500, 1000, 2000]
+regelparameter:
+  min_pv:           500
+  min_soc:          30
+  lade_schwelle:    1000
+  entlade_schwelle: 1000
+  hysterese:        200
+  delay:            60
+  poll_intervall:   5
+  soc_cache_max:    60
