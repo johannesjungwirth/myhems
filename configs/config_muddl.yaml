@@ -21,7 +21,7 @@ heizstab:
   relais: [500, 1000, 2000]
 regelparameter:
   min_pv:           500
-  min_soc:          30
+  min_soc:          90
   lade_schwelle:    1000
   entlade_schwelle: 1000
   hysterese:        200
