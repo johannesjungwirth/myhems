@@ -1,7 +1,6 @@
 """
-myhems v0.4.0
-- Heizstab: beliebige Anzahl Relais, beliebige Leistungen
-- Software berechnet automatisch alle sinnvollen Kombinationen
+myhems v0.5.3
+- "Standort" aus Dashboard-Header entfernt
 """
 
 import time
@@ -16,7 +15,7 @@ import requests
 import yaml
 from flask import Flask, jsonify, render_template_string
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +44,6 @@ MARSTEK_IP      = G["marstek_ip"]
 MARSTEK_PORT    = int(G.get("marstek_port", 30000))
 
 def parse_shelly(cfg, default_typ="EM"):
-    """Gibt (ip, typ) zurück. Akzeptiert String oder {ip, typ} Dict."""
     if isinstance(cfg, str):
         return cfg, default_typ
     return cfg["ip"], cfg.get("typ", default_typ)
@@ -58,7 +56,6 @@ log.info(f"PV:     {SHELLY_PV_IP} typ={SHELLY_PV_TYP}")
 log.info(f"Netz:   {SHELLY_NETZ_IP} typ={SHELLY_NETZ_TYP}")
 log.info(f"Marstek:{SHELLY_MARSTEK_IP} typ={SHELLY_MARSTEK_TYP}")
 
-# Heizstab: entweder ein Shelly (String/Dict) oder mehrere (Liste)
 _heizstab_cfg = G["shelly_heizstab"]
 if isinstance(_heizstab_cfg, (str, dict)):
     HEIZSTAB_MODUS   = "single"
@@ -82,19 +79,12 @@ SOC_CACHE_MAX    = int(R.get("soc_cache_max", 60))
 
 # ─── HEIZSTAB-KOMBINATIONEN BERECHNEN ───────────────────────────────────────
 
-RELAIS_LEISTUNG = CFG["heizstab"]["relais"]  # z.B. [2000,2000,2000] oder [500,1000,2000]
+RELAIS_LEISTUNG = CFG["heizstab"]["relais"]
 ANZAHL_RELAIS   = len(RELAIS_LEISTUNG)
 
 def berechne_kombinationen(relais_leistung):
-    """
-    Berechnet alle sinnvollen Schaltkombinationen.
-    Gibt zurück: sortierte Liste von (leistung_w, relais_maske)
-    relais_maske = Liste von bool, z.B. [True, True, False]
-    Duplikate (gleiche Leistung) werden auf die einfachste Kombination reduziert.
-    """
     n = len(relais_leistung)
-    kombinationen = {}  # leistung → relais_maske (einfachste gewinnt)
-
+    kombinationen = {}
     for r in range(1, n + 1):
         for combo in iter_combinations(range(n), r):
             leistung = sum(relais_leistung[i] for i in combo)
@@ -102,26 +92,20 @@ def berechne_kombinationen(relais_leistung):
             if leistung not in kombinationen:
                 kombinationen[leistung] = maske
             else:
-                # Einfachste Kombination bevorzugen (weniger Relais)
                 if sum(maske) < sum(kombinationen[leistung]):
                     kombinationen[leistung] = maske
-
-    # Sortiert nach Leistung, mit AUS (0W) als Index 0
-    sortiert = sorted(kombinationen.items())  # [(500, [...]), (1000, [...]), ...]
+    sortiert = sorted(kombinationen.items())
     result = [(0, [False] * n)] + [(w, m) for w, m in sortiert]
     return result
 
-# STUFEN[i] = (leistung_w, relais_maske)
-# STUFEN[0] = (0, [False, False, False]) = AUS
 STUFEN = berechne_kombinationen(RELAIS_LEISTUNG)
-ANZAHL_STUFEN = len(STUFEN) - 1  # ohne AUS
+ANZAHL_STUFEN = len(STUFEN) - 1
 
 log.info(f"Heizstab: {ANZAHL_RELAIS} Relais {RELAIS_LEISTUNG}W → {ANZAHL_STUFEN} Kombinationen")
 for i, (w, m) in enumerate(STUFEN):
     relais_an = [j+1 for j, on in enumerate(m) if on]
     log.info(f"  Kombination {i}: {w}W – Relais {relais_an}")
 
-# Thermostat-Schwelle: 50% der jeweiligen Stufenleistung
 THERMOSTAT_SCHWELLE = {i: STUFEN[i][0] // 2 for i in range(1, len(STUFEN))}
 
 # ─── GLOBALER ZUSTAND ───────────────────────────────────────────────────────
@@ -159,11 +143,10 @@ def shelly_get(ip, path, timeout=3):
         return None
 
 def lese_em_leistung(ip, typ):
-    """Liest Wirkleistung je nach Shelly-Typ."""
     if typ == "EM1":
         data = shelly_get(ip, "/rpc/EM1.GetStatus?id=0")
         return round(data.get("act_power", 0)) if data else None
-    else:  # EM (Pro 3EM)
+    else:
         data = shelly_get(ip, "/rpc/EM.GetStatus?id=0")
         return round(data.get("total_act_power", 0)) if data else None
 
@@ -206,11 +189,6 @@ def lese_marstek_soc():
     return None
 
 def setze_relais(nr, ein):
-    """
-    Schaltet Relais nr.
-    Single-Modus: ein Shelly, Relais-ID = nr
-    Multi-Modus:  Shelly nr, Relais-ID = 0
-    """
     aktion = "true" if ein else "false"
     if HEIZSTAB_MODUS == "single":
         return shelly_get(HEIZSTAB_SHELLYS[0], f"/rpc/Switch.Set?id={nr}&on={aktion}") is not None
@@ -218,11 +196,9 @@ def setze_relais(nr, ein):
         return shelly_get(HEIZSTAB_SHELLYS[nr], f"/rpc/Switch.Set?id=0&on={aktion}") is not None
 
 def setze_kombination(neue_stufe, alte_stufe):
-    """Schaltet von alter auf neue Kombination – nur geänderte Relais werden angefasst."""
     _, alte_maske = STUFEN[alte_stufe]
     _, neue_maske = STUFEN[neue_stufe]
     ok = True
-    # Erst ausschalten, dann einschalten
     for i, (alt, neu) in enumerate(zip(alte_maske, neue_maske)):
         if alt and not neu:
             ok &= setze_relais(i, False)
@@ -255,7 +231,6 @@ def bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok):
 def regelschleife():
     global _regel_stufe, _letzter_wechsel
     log.info(f"myhems v{VERSION} – Standort {STANDORT_NAME} gestartet")
-    # Beim Start alle Relais ausschalten
     for r in range(ANZAHL_RELAIS):
         setze_relais(r, False)
     log.info("Alle Relais beim Start ausgeschaltet")
@@ -302,7 +277,6 @@ def regelschleife():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Sofortabschaltung
             if stufe > 0 and soc is not None and soc < MIN_SOC:
                 log.info(f"🔋 Sofortabschaltung: SOC {soc}% < {MIN_SOC}%")
                 setze_kombination(0, stufe); _regel_stufe = 0; _letzter_wechsel = now
@@ -311,10 +285,8 @@ def regelschleife():
             if not delay_ok:
                 time.sleep(POLL_INTERVAL); continue
 
-            # Überschuss-Signal
             ueberschuss_signal = (marstek > LADE_SCHWELLE) or (netz is not None and netz < -LADE_SCHWELLE)
 
-            # Hochschalten
             if stufe < ANZAHL_STUFEN and ueberschuss_signal and (soc is None or soc >= MIN_SOC):
                 neu = stufe + 1
                 grund = f"Marstek lädt {marstek}W" if marstek > LADE_SCHWELLE else f"Einspeisung {abs(netz)}W"
@@ -323,7 +295,6 @@ def regelschleife():
                     _regel_stufe = neu; _letzter_wechsel = now
                 time.sleep(POLL_INTERVAL); continue
 
-            # Runterschalten
             if stufe > 0 and marstek < -(ENTLADE_SCHWELLE + HYSTERESE):
                 neu = stufe - 1
                 log.info(f"▼ Kombination {stufe}→{neu} ({STUFEN[neu][0]}W): Marstek entlädt {abs(marstek)}W")
@@ -431,9 +402,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <text x="174" y="150" font-family="Syncopate,sans-serif" font-size="46" font-weight="700" fill="#e0f2fe" letter-spacing="3">HEMS</text>
     <text x="178" y="168" font-family="Share Tech Mono,monospace" font-size="7" fill="#1e3a5f" letter-spacing="3">HOME ENERGY MGMT SYS</text>
   </svg>
-  <!-- Standort + Titel -->
+  <!-- Standortname + Titel -->
   <div style="margin-left:12px;">
-    <div class="syn" style="font-size:7px;color:var(--cyan);letter-spacing:5px;margin-bottom:4px;">MYHEMS · STANDORT {{ standort|upper }}</div>
+    <div class="syn" style="font-size:7px;color:var(--cyan);letter-spacing:5px;margin-bottom:4px;">MYHEMS · {{ standort|upper }}</div>
     <div class="syn" style="font-size:15px;font-weight:700;letter-spacing:4px;">ENERGIE DASHBOARD</div>
     <div class="syn" style="font-size:7px;color:var(--dim);letter-spacing:2px;margin-top:2px;" id="version">v—</div>
   </div>
