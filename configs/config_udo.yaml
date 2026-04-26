@@ -11,14 +11,12 @@ geraete:
   marstek_port:    30000
 
 heizstab:
-  relais: [2000, 2000, 2000]   # 3x2kW → 3 Stufen: 2/4/6kW
+  relais: [2000, 2000, 2000]   # 3x2kW → Kombinationen: 2/4/6kW
 
 regelparameter:
-  min_pv:            500
-  min_soc:           80
-  lade_schwelle:     1000
-  entlade_schwelle:  1000
-  hysterese:         200
-  delay:             60
-  poll_intervall:    5
-  soc_cache_max:     60
+  min_soc:                 80
+  hochschalten_schwelle:   1100
+  runterschalten_schwelle: 1100
+  delay:                   60
+  poll_intervall:          5
+  soc_cache_max:           60

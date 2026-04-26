@@ -1,8 +1,10 @@
 """
-myhems v0.6.0
+myhems v0.7.0
 - Config automatisch per Hostname geladen (configs/config_<hostname>.yaml)
 - config.yaml als Fallback
 - Tagesenergie: PV, Einspeisung, Bezug, Eigenverbrauch (heute + gestern) in energy_history.json
+- Regelparameter umbenannt: hochschalten_schwelle / runterschalten_schwelle (min_pv entfernt)
+- SOC-Abschaltung stufenweise mit delay statt Sofortabschaltung
 """
 
 import time
@@ -18,7 +20,7 @@ import requests
 import yaml
 from flask import Flask, jsonify, render_template_string
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,14 +80,14 @@ else:
 log.info(f"Heizstab-Modus: {HEIZSTAB_MODUS}, Shellys: {HEIZSTAB_SHELLYS}")
 
 R = CFG["regelparameter"]
-MIN_PV           = int(R["min_pv"])
-MIN_SOC          = int(R["min_soc"])
-LADE_SCHWELLE    = int(R["lade_schwelle"])
-ENTLADE_SCHWELLE = int(R["entlade_schwelle"])
-HYSTERESE        = int(R["hysterese"])
-DELAY            = int(R["delay"])
-POLL_INTERVAL    = int(R.get("poll_intervall", 5))
-SOC_CACHE_MAX    = int(R.get("soc_cache_max", 60))
+MIN_SOC                 = int(R["min_soc"])
+HOCHSCHALTEN_SCHWELLE   = int(R["hochschalten_schwelle"])
+RUNTERSCHALTEN_SCHWELLE = int(R["runterschalten_schwelle"])
+DELAY                   = int(R["delay"])
+POLL_INTERVAL           = int(R.get("poll_intervall", 5))
+SOC_CACHE_MAX           = int(R.get("soc_cache_max", 60))
+
+log.info(f"Regelparameter: min_soc={MIN_SOC}% hoch={HOCHSCHALTEN_SCHWELLE}W runter={RUNTERSCHALTEN_SCHWELLE}W delay={DELAY}s")
 
 # ─── HEIZSTAB-KOMBINATIONEN ─────────────────────────────────────────────────
 
@@ -119,14 +121,6 @@ for i, (w, m) in enumerate(STUFEN):
 THERMOSTAT_SCHWELLE = {i: STUFEN[i][0] // 2 for i in range(1, len(STUFEN))}
 
 # ─── TAGESENERGIE ───────────────────────────────────────────────────────────
-#
-# Speichert exakt 2 Tage (heute + gestern) als JSON.
-# Je Tag: pv_wh, einspeisung_wh, bezug_wh  (Wh als float)
-# Eigenverbrauch wird nicht gespeichert – er wird live berechnet:
-#   eigenverbrauch = pv - einspeisung  (niemals negativ)
-#
-# Die Datei wird bei jedem Schreibvorgang auf heute+gestern bereinigt
-# → wächst niemals über ~200 Bytes.
 
 HISTORY_PFAD  = os.path.join(os.path.dirname(__file__), "energy_history.json")
 _history_lock = threading.Lock()
@@ -145,7 +139,6 @@ def _lade_history():
         return {}
 
 def _speichere_history(history):
-    """Schreibt nur heute + gestern – Datei bleibt konstant klein."""
     heute   = date.today().isoformat()
     gestern = (date.today() - timedelta(days=1)).isoformat()
     bereinigt = {k: v for k, v in history.items() if k in (heute, gestern)}
@@ -159,35 +152,23 @@ _history = _lade_history()
 log.info(f"Tagesenergie geladen: {list(_history.keys())}")
 
 def akkumuliere_energie(pv_w, netz_w):
-    """
-    Jeden Poll-Zyklus aufrufen.
-    pv_w:   PV-Leistung in Watt (immer >= 0)
-    netz_w: Netzleistung in Watt (negativ = Einspeisung, positiv = Bezug)
-    Rechnet Watt → Wh über das Poll-Intervall und addiert auf den heutigen Tag.
-    """
     global _history
     if pv_w is None or netz_w is None:
         return
-
     heute   = date.today().isoformat()
-    delta_h = POLL_INTERVAL / 3600.0  # z.B. 5s → 0.001389h
-
+    delta_h = POLL_INTERVAL / 3600.0
     with _history_lock:
         if heute not in _history:
             _history[heute] = _leerer_tag()
             log.info(f"Neuer Tag: {heute} – Tageszähler zurückgesetzt")
-
         _history[heute]["pv_wh"] += pv_w * delta_h
-
         if netz_w < 0:
             _history[heute]["einspeisung_wh"] += abs(netz_w) * delta_h
         else:
             _history[heute]["bezug_wh"] += netz_w * delta_h
-
         _speichere_history(_history)
 
 def hole_tagesenergie():
-    """Gibt aufbereitetes Dict zurück (Wh → kWh, Eigenverbrauch live berechnet)."""
     heute   = date.today().isoformat()
     gestern = (date.today() - timedelta(days=1)).isoformat()
 
@@ -306,20 +287,20 @@ def setze_kombination(neue_stufe, alte_stufe):
 def bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok):
     if pv is None or marstek is None:
         return "Messfehler – Gerät nicht erreichbar", "error"
-    if soc is not None and soc < MIN_SOC:
-        return f"Ladestand {soc} % < Minimum {MIN_SOC} % – gesperrt", "blocked"
+    if soc is not None and soc < MIN_SOC and stufe > 0:
+        return f"Ladestand {soc} % < Minimum {MIN_SOC} % – schalte stufenweise ab", "blocked"
     if not delay_ok:
         return "Wartezeit zwischen Schaltvorgängen läuft", "waiting"
     if stufe == ANZAHL_STUFEN:
         return f"Maximalstufe {STUFEN[stufe][0]} W aktiv", "max"
-    if marstek > LADE_SCHWELLE:
-        return f"Batterie lädt {marstek} W > {LADE_SCHWELLE} W – Hochschalten möglich", "ready"
-    if netz is not None and netz < -LADE_SCHWELLE:
-        return f"Einspeisung {abs(netz)} W > {LADE_SCHWELLE} W – Speicher voll, Hochschalten möglich", "ready"
-    if stufe > 0 and marstek < -(ENTLADE_SCHWELLE + HYSTERESE):
-        return f"Batterie entlädt {abs(marstek)} W – Runterschalten", "down"
+    ueberschuss_signal = (marstek > HOCHSCHALTEN_SCHWELLE) or (netz is not None and netz < -HOCHSCHALTEN_SCHWELLE)
+    if ueberschuss_signal and (soc is None or soc >= MIN_SOC):
+        grund = f"Batterie lädt {marstek} W" if marstek > HOCHSCHALTEN_SCHWELLE else f"Einspeisung {abs(netz)} W"
+        return f"{grund} > {HOCHSCHALTEN_SCHWELLE} W – Hochschalten möglich", "ready"
+    if stufe > 0 and marstek < -RUNTERSCHALTEN_SCHWELLE:
+        return f"Batterie entlädt {abs(marstek)} W > {RUNTERSCHALTEN_SCHWELLE} W – Runterschalten", "down"
     if marstek > 0:
-        return f"Batterie lädt {marstek} W – noch {LADE_SCHWELLE - marstek} W bis Hochschalten", "waiting"
+        return f"Batterie lädt {marstek} W – noch {HOCHSCHALTEN_SCHWELLE - marstek} W bis Hochschalten", "waiting"
     return "Kein Überschuss – Heizstab hält Stufe", "holding"
 
 def regelschleife():
@@ -350,7 +331,6 @@ def regelschleife():
 
             regeltext, regeltyp = bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok)
 
-            # Tagesenergie akkumulieren
             akkumuliere_energie(pv, netz)
 
             with _state_lock:
@@ -374,29 +354,38 @@ def regelschleife():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            if stufe > 0 and soc is not None and soc < MIN_SOC:
-                log.info(f"🔋 Sofortabschaltung: SOC {soc}% < {MIN_SOC}%")
-                setze_kombination(0, stufe); _regel_stufe = 0; _letzter_wechsel = now
-                time.sleep(POLL_INTERVAL); continue
-
             if not delay_ok:
-                time.sleep(POLL_INTERVAL); continue
+                time.sleep(POLL_INTERVAL)
+                continue
 
-            ueberschuss_signal = (marstek > LADE_SCHWELLE) or (netz is not None and netz < -LADE_SCHWELLE)
+            # SOC-Schutz: stufenweise abschalten mit delay
+            if stufe > 0 and soc is not None and soc < MIN_SOC:
+                neu = stufe - 1
+                log.info(f"🔋 SOC {soc}% < {MIN_SOC}% – Stufe {stufe}→{neu} ({STUFEN[neu][0]}W)")
+                if setze_kombination(neu, stufe):
+                    _regel_stufe = neu
+                    _letzter_wechsel = now
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            ueberschuss_signal = (marstek > HOCHSCHALTEN_SCHWELLE) or (netz is not None and netz < -HOCHSCHALTEN_SCHWELLE)
 
             if stufe < ANZAHL_STUFEN and ueberschuss_signal and (soc is None or soc >= MIN_SOC):
                 neu = stufe + 1
-                grund = f"Marstek lädt {marstek}W" if marstek > LADE_SCHWELLE else f"Einspeisung {abs(netz)}W"
+                grund = f"Marstek lädt {marstek}W" if marstek > HOCHSCHALTEN_SCHWELLE else f"Einspeisung {abs(netz)}W"
                 log.info(f"▲ Kombination {stufe}→{neu} ({STUFEN[neu][0]}W): {grund}")
                 if setze_kombination(neu, stufe):
-                    _regel_stufe = neu; _letzter_wechsel = now
-                time.sleep(POLL_INTERVAL); continue
+                    _regel_stufe = neu
+                    _letzter_wechsel = now
+                time.sleep(POLL_INTERVAL)
+                continue
 
-            if stufe > 0 and marstek < -(ENTLADE_SCHWELLE + HYSTERESE):
+            if stufe > 0 and marstek < -RUNTERSCHALTEN_SCHWELLE:
                 neu = stufe - 1
                 log.info(f"▼ Kombination {stufe}→{neu} ({STUFEN[neu][0]}W): Marstek entlädt {abs(marstek)}W")
                 if setze_kombination(neu, stufe):
-                    _regel_stufe = neu; _letzter_wechsel = now
+                    _regel_stufe = neu
+                    _letzter_wechsel = now
 
         except Exception as e:
             log.error(f"Fehler in Regelschleife: {e}")
@@ -417,12 +406,10 @@ def api_status():
     state["stufen"]          = [(w, m) for w, m in STUFEN]
     state["tagesenergie"]    = hole_tagesenergie()
     state["params"] = {
-        "MIN_PV":            MIN_PV,
-        "MIN_SOC":           MIN_SOC,
-        "LADE_SCHWELLE":     LADE_SCHWELLE,
-        "ENTLADE_SCHWELLE":  ENTLADE_SCHWELLE,
-        "HYSTERESE":         HYSTERESE,
-        "DELAY":             DELAY,
+        "MIN_SOC":                  MIN_SOC,
+        "HOCHSCHALTEN_SCHWELLE":    HOCHSCHALTEN_SCHWELLE,
+        "RUNTERSCHALTEN_SCHWELLE":  RUNTERSCHALTEN_SCHWELLE,
+        "DELAY":                    DELAY,
     }
     return jsonify(state)
 
@@ -467,6 +454,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .regeltext.ready{color:var(--green)}.regeltext.blocked{color:var(--orange)}
   .regeltext.error{color:var(--red)}.regeltext.waiting{color:var(--cyan)}
   .regeltext.down{color:var(--orange)}.regeltext.holding{color:var(--dim)}
+  .regeltext.max{color:var(--yellow)}
   .ts{font-size:7px;color:var(--dim);text-align:center;letter-spacing:3px;margin-top:4px;}
   .twarn{background:#1c0a00;border:1px solid #7f1d1d;border-radius:4px;padding:7px 10px;margin-bottom:10px;display:flex;align-items:center;gap:8px;}
   .twarn-dot{width:6px;height:6px;border-radius:50%;background:#ef4444;box-shadow:0 0 6px #ef4444;flex-shrink:0;}
@@ -563,13 +551,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card">
     <div class="syn lbl" style="margin-bottom:10px;">BEDINGUNGEN</div>
     <div class="bed" id="bedSOC"><span class="bl syn">—</span><span class="bv">—</span></div>
-    <div class="bed" id="bedLade"><span class="bl syn">—</span><span class="bv">—</span></div>
+    <div class="bed" id="bedHoch"><span class="bl syn">—</span><span class="bv">—</span></div>
     <div style="border-top:1px solid var(--border2);margin:10px 0;"></div>
     <div class="syn lbl" style="margin-bottom:6px;">REGELSTATUS</div>
     <div class="regeltext" id="regeltext">Verbinde...</div>
   </div>
 
-  <!-- TAGESENERGIE -->
   <div class="card">
     <div class="syn lbl" style="margin-bottom:10px;">TAGESENERGIE</div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;">
@@ -655,14 +642,12 @@ async function update(){
     document.getElementById("eigenVal").textContent=fmtAbs(d.hausverbrauch);
     const p=d.params;
     bed("bedSOC",d.soc==null||d.soc>=p.MIN_SOC,"LADESTAND ≥ "+p.MIN_SOC+" %",d.soc!=null?Math.round(d.soc)+" %":"n/v");
-    bed("bedLade",(d.marstek||0)>p.LADE_SCHWELLE||(d.netz||0)<-p.LADE_SCHWELLE,
-      "ÜBERSCHUSS > "+p.LADE_SCHWELLE.toLocaleString("de-DE")+" W",
+    bed("bedHoch",(d.marstek||0)>p.HOCHSCHALTEN_SCHWELLE||(d.netz||0)<-p.HOCHSCHALTEN_SCHWELLE,
+      "ÜBERSCHUSS > "+p.HOCHSCHALTEN_SCHWELLE.toLocaleString("de-DE")+" W",
       fmt(d.marstek));
     const rt=document.getElementById("regeltext");
     rt.textContent=d.regeltext; rt.className="regeltext "+(d.regeltyp||"");
     document.getElementById("ts").textContent="LETZTE AKTUALISIERUNG · "+new Date(d.timestamp*1000).toLocaleTimeString("de-DE");
-
-    // Tagesenergie
     if(d.tagesenergie){
       const h=d.tagesenergie.heute, g=d.tagesenergie.gestern;
       document.getElementById("e-pv-heute").textContent    = fmtKwh(h.pv_kwh);

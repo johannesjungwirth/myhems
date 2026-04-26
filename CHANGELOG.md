@@ -1,5 +1,13 @@
 # myhems Changelog
 
+## v0.7.0 (April 2026)
+- Regelparameter umbenannt: lade_schwelle → hochschalten_schwelle, entlade_schwelle → runterschalten_schwelle
+- hysterese-Parameter entfernt – Abstand zwischen Schwellen übernimmt diese Rolle
+- min_pv-Parameter entfernt – redundant da Marstek autonom auf Nulleinspeisung regelt
+- SOC-Schutz: stufenweise Abschaltung mit delay statt Sofortabschaltung auf 0
+- config_udo.yaml: hochschalten_schwelle=1100W, runterschalten_schwelle=1100W
+- config_muddl.yaml: hochschalten_schwelle=300W, runterschalten_schwelle=300W
+
 ## v0.6.0 (April 2026)
 - Tagesenergie-Feature: PV, Einspeisung, Netzbezug, Eigenverbrauch (heute + gestern)
 - Akkumulierung per Poll-Zyklus (Watt → Wh), persistiert in energy_history.json
