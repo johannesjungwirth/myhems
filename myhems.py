@@ -1,7 +1,8 @@
 """
-myhems v0.5.4
+myhems v0.6.0
 - Config automatisch per Hostname geladen (configs/config_<hostname>.yaml)
 - config.yaml als Fallback
+- Tagesenergie: PV, Einspeisung, Bezug, Eigenverbrauch (heute + gestern) in energy_history.json
 """
 
 import time
@@ -11,12 +12,13 @@ import logging
 import threading
 import sys
 import os
+from datetime import date, timedelta
 from itertools import combinations as iter_combinations
 import requests
 import yaml
 from flask import Flask, jsonify, render_template_string
 
-VERSION = "0.5.4"
+VERSION = "0.6.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,11 +31,8 @@ log = logging.getLogger("myhems")
 
 def lade_config():
     basis = os.path.dirname(__file__)
-    hostname = socket.gethostname()  # z.B. "hemsbox-udo"
-    # Hostname-Teil nach "-" extrahieren: "hemsbox-udo" → "udo"
+    hostname = socket.gethostname()
     teil = hostname.split("-")[-1] if "-" in hostname else hostname
-
-    # Suche: configs/config_<teil>.yaml → config.yaml
     kandidaten = [
         os.path.join(basis, "configs", f"config_{teil}.yaml"),
         os.path.join(basis, "config.yaml"),
@@ -44,7 +43,6 @@ def lade_config():
                 cfg = yaml.safe_load(f)
             log.info(f"Config geladen: {pfad} (Standort: '{cfg['standort']['name']}')")
             return cfg
-
     log.error(f"Keine Config gefunden. Gesucht: {kandidaten}")
     sys.exit(1)
 
@@ -89,7 +87,7 @@ DELAY            = int(R["delay"])
 POLL_INTERVAL    = int(R.get("poll_intervall", 5))
 SOC_CACHE_MAX    = int(R.get("soc_cache_max", 60))
 
-# ─── HEIZSTAB-KOMBINATIONEN BERECHNEN ───────────────────────────────────────
+# ─── HEIZSTAB-KOMBINATIONEN ─────────────────────────────────────────────────
 
 RELAIS_LEISTUNG = CFG["heizstab"]["relais"]
 ANZAHL_RELAIS   = len(RELAIS_LEISTUNG)
@@ -119,6 +117,90 @@ for i, (w, m) in enumerate(STUFEN):
     log.info(f"  Kombination {i}: {w}W – Relais {relais_an}")
 
 THERMOSTAT_SCHWELLE = {i: STUFEN[i][0] // 2 for i in range(1, len(STUFEN))}
+
+# ─── TAGESENERGIE ───────────────────────────────────────────────────────────
+#
+# Speichert exakt 2 Tage (heute + gestern) als JSON.
+# Je Tag: pv_wh, einspeisung_wh, bezug_wh  (Wh als float)
+# Eigenverbrauch wird nicht gespeichert – er wird live berechnet:
+#   eigenverbrauch = pv - einspeisung  (niemals negativ)
+#
+# Die Datei wird bei jedem Schreibvorgang auf heute+gestern bereinigt
+# → wächst niemals über ~200 Bytes.
+
+HISTORY_PFAD  = os.path.join(os.path.dirname(__file__), "energy_history.json")
+_history_lock = threading.Lock()
+
+def _leerer_tag():
+    return {"pv_wh": 0.0, "einspeisung_wh": 0.0, "bezug_wh": 0.0}
+
+def _lade_history():
+    if not os.path.exists(HISTORY_PFAD):
+        return {}
+    try:
+        with open(HISTORY_PFAD) as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning(f"energy_history.json Ladefehler: {e} – starte neu")
+        return {}
+
+def _speichere_history(history):
+    """Schreibt nur heute + gestern – Datei bleibt konstant klein."""
+    heute   = date.today().isoformat()
+    gestern = (date.today() - timedelta(days=1)).isoformat()
+    bereinigt = {k: v for k, v in history.items() if k in (heute, gestern)}
+    try:
+        with open(HISTORY_PFAD, "w") as f:
+            json.dump(bereinigt, f)
+    except Exception as e:
+        log.warning(f"energy_history.json Schreibfehler: {e}")
+
+_history = _lade_history()
+log.info(f"Tagesenergie geladen: {list(_history.keys())}")
+
+def akkumuliere_energie(pv_w, netz_w):
+    """
+    Jeden Poll-Zyklus aufrufen.
+    pv_w:   PV-Leistung in Watt (immer >= 0)
+    netz_w: Netzleistung in Watt (negativ = Einspeisung, positiv = Bezug)
+    Rechnet Watt → Wh über das Poll-Intervall und addiert auf den heutigen Tag.
+    """
+    global _history
+    if pv_w is None or netz_w is None:
+        return
+
+    heute   = date.today().isoformat()
+    delta_h = POLL_INTERVAL / 3600.0  # z.B. 5s → 0.001389h
+
+    with _history_lock:
+        if heute not in _history:
+            _history[heute] = _leerer_tag()
+            log.info(f"Neuer Tag: {heute} – Tageszähler zurückgesetzt")
+
+        _history[heute]["pv_wh"] += pv_w * delta_h
+
+        if netz_w < 0:
+            _history[heute]["einspeisung_wh"] += abs(netz_w) * delta_h
+        else:
+            _history[heute]["bezug_wh"] += netz_w * delta_h
+
+        _speichere_history(_history)
+
+def hole_tagesenergie():
+    """Gibt aufbereitetes Dict zurück (Wh → kWh, Eigenverbrauch live berechnet)."""
+    heute   = date.today().isoformat()
+    gestern = (date.today() - timedelta(days=1)).isoformat()
+
+    def aufbereite(tag_str):
+        with _history_lock:
+            d = _history.get(tag_str, _leerer_tag())
+        pv  = round(d["pv_wh"] / 1000, 2)
+        ein = round(d["einspeisung_wh"] / 1000, 2)
+        bez = round(d["bezug_wh"] / 1000, 2)
+        ev  = round(max(pv - ein, 0), 2)
+        return {"pv_kwh": pv, "einspeisung_kwh": ein, "bezug_kwh": bez, "eigenverbrauch_kwh": ev}
+
+    return {"heute": aufbereite(heute), "gestern": aufbereite(gestern)}
 
 # ─── GLOBALER ZUSTAND ───────────────────────────────────────────────────────
 
@@ -268,6 +350,9 @@ def regelschleife():
 
             regeltext, regeltyp = bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok)
 
+            # Tagesenergie akkumulieren
+            akkumuliere_energie(pv, netz)
+
             with _state_lock:
                 _state.update({
                     "pv":             pv,
@@ -330,6 +415,7 @@ def api_status():
     state["standort"]        = STANDORT_NAME
     state["relais_leistung"] = RELAIS_LEISTUNG
     state["stufen"]          = [(w, m) for w, m in STUFEN]
+    state["tagesenergie"]    = hole_tagesenergie()
     state["params"] = {
         "MIN_PV":            MIN_PV,
         "MIN_SOC":           MIN_SOC,
@@ -483,6 +569,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="regeltext" id="regeltext">Verbinde...</div>
   </div>
 
+  <!-- TAGESENERGIE -->
+  <div class="card">
+    <div class="syn lbl" style="margin-bottom:10px;">TAGESENERGIE</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;">
+      <div></div>
+      <div class="syn" style="font-size:7px;letter-spacing:2px;color:var(--cyan);padding-bottom:6px;text-align:right;">HEUTE</div>
+      <div class="syn" style="font-size:7px;letter-spacing:2px;color:var(--dim);padding-bottom:6px;text-align:right;">GESTERN</div>
+
+      <div class="syn" style="font-size:7px;letter-spacing:1px;color:var(--yellow);padding:6px 0;border-top:1px solid var(--border2);">PV ERZEUGUNG</div>
+      <div style="font-size:11px;text-align:right;padding:6px 0;border-top:1px solid var(--border2);color:var(--yellow);" id="e-pv-heute">—</div>
+      <div style="font-size:11px;text-align:right;padding:6px 0;border-top:1px solid var(--border2);color:var(--dim);" id="e-pv-gestern">—</div>
+
+      <div class="syn" style="font-size:7px;letter-spacing:1px;color:var(--green);padding:6px 0;border-top:1px solid var(--border2);">EINSPEISUNG</div>
+      <div style="font-size:11px;text-align:right;padding:6px 0;border-top:1px solid var(--border2);color:var(--green);" id="e-ein-heute">—</div>
+      <div style="font-size:11px;text-align:right;padding:6px 0;border-top:1px solid var(--border2);color:var(--dim);" id="e-ein-gestern">—</div>
+
+      <div class="syn" style="font-size:7px;letter-spacing:1px;color:var(--red);padding:6px 0;border-top:1px solid var(--border2);">NETZBEZUG</div>
+      <div style="font-size:11px;text-align:right;padding:6px 0;border-top:1px solid var(--border2);color:var(--red);" id="e-bez-heute">—</div>
+      <div style="font-size:11px;text-align:right;padding:6px 0;border-top:1px solid var(--border2);color:var(--dim);" id="e-bez-gestern">—</div>
+
+      <div class="syn" style="font-size:7px;letter-spacing:1px;color:var(--blue);padding:6px 0;border-top:1px solid var(--border2);">EIGENVERBRAUCH</div>
+      <div style="font-size:11px;text-align:right;padding:6px 0;border-top:1px solid var(--border2);color:var(--blue);" id="e-ev-heute">—</div>
+      <div style="font-size:11px;text-align:right;padding:6px 0;border-top:1px solid var(--border2);color:var(--dim);" id="e-ev-gestern">—</div>
+    </div>
+  </div>
+
   <div class="syn ts" id="ts">LETZTE AKTUALISIERUNG · —</div>
 </div>
 </div>
@@ -490,6 +602,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 function fmt(v){if(v==null)return"— W";return(v>0?"+":"")+Math.round(v).toLocaleString("de-DE")+" W";}
 function fmtAbs(v){if(v==null)return"— W";return Math.round(v).toLocaleString("de-DE")+" W";}
+function fmtKwh(v){if(v==null||v===undefined)return"—";return v.toFixed(2)+" kWh";}
 function bed(id,ok,lbl,val){
   const e=document.getElementById(id);
   e.className="bed "+(ok?"ok":"fail");
@@ -548,6 +661,19 @@ async function update(){
     const rt=document.getElementById("regeltext");
     rt.textContent=d.regeltext; rt.className="regeltext "+(d.regeltyp||"");
     document.getElementById("ts").textContent="LETZTE AKTUALISIERUNG · "+new Date(d.timestamp*1000).toLocaleTimeString("de-DE");
+
+    // Tagesenergie
+    if(d.tagesenergie){
+      const h=d.tagesenergie.heute, g=d.tagesenergie.gestern;
+      document.getElementById("e-pv-heute").textContent    = fmtKwh(h.pv_kwh);
+      document.getElementById("e-pv-gestern").textContent  = fmtKwh(g.pv_kwh);
+      document.getElementById("e-ein-heute").textContent   = fmtKwh(h.einspeisung_kwh);
+      document.getElementById("e-ein-gestern").textContent = fmtKwh(g.einspeisung_kwh);
+      document.getElementById("e-bez-heute").textContent   = fmtKwh(h.bezug_kwh);
+      document.getElementById("e-bez-gestern").textContent = fmtKwh(g.bezug_kwh);
+      document.getElementById("e-ev-heute").textContent    = fmtKwh(h.eigenverbrauch_kwh);
+      document.getElementById("e-ev-gestern").textContent  = fmtKwh(g.eigenverbrauch_kwh);
+    }
   } catch(e){
     document.getElementById("dot").className="dot error";
     document.getElementById("regeltext").textContent="Verbindungsfehler";
