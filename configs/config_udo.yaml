@@ -1,7 +1,6 @@
 standort:
   name: Udo
   domain: udo.myhems.org
-
 geraete:
   shelly_pv:       "192.168.188.24"
   shelly_netz:     "192.168.188.70"
@@ -9,12 +8,11 @@ geraete:
   shelly_heizstab: "192.168.188.76"
   marstek_ip:      "192.168.188.46"
   marstek_port:    30000
-
 heizstab:
   relais: [2000, 2000, 2000]   # 3x2kW → Kombinationen: 2/4/6kW
-
 regelparameter:
-  min_soc:                 80
+  min_soc_aus:             80   # Abschalten wenn SOC unter diesen Wert fällt
+  min_soc_ein:             85   # Hochschalten erst wieder ab diesem Wert
   hochschalten_schwelle:   1100
   runterschalten_schwelle: 1100
   delay:                   60

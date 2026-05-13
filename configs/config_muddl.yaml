@@ -1,7 +1,6 @@
 standort:
   name: Muddl
   domain: muddl.myhems.org
-
 geraete:
   shelly_pv:
     ip: "192.168.178.122"
@@ -18,12 +17,11 @@ geraete:
     - ip: "192.168.178.25"
   marstek_ip:   "192.168.178.181"
   marstek_port: 30000
-
 heizstab:
   relais: [500, 1000, 2000]   # 3 Relais → Kombinationen: 500/1000/1500/2000/2500/3500W
-
 regelparameter:
-  min_soc:                 90
+  min_soc_aus:             90   # Abschalten wenn SOC unter diesen Wert fällt
+  min_soc_ein:             95   # Hochschalten erst wieder ab diesem Wert
   hochschalten_schwelle:   300
   runterschalten_schwelle: 300
   delay:                   60

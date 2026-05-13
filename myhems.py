@@ -1,10 +1,9 @@
 """
-myhems v0.7.0
-- Config automatisch per Hostname geladen (configs/config_<hostname>.yaml)
-- config.yaml als Fallback
-- Tagesenergie: PV, Einspeisung, Bezug, Eigenverbrauch (heute + gestern) in energy_history.json
-- Regelparameter umbenannt: hochschalten_schwelle / runterschalten_schwelle (min_pv entfernt)
-- SOC-Abschaltung stufenweise mit delay statt Sofortabschaltung
+myhems v0.8.0
+- min_soc aufgeteilt in min_soc_aus / min_soc_ein (Hysterese)
+  Verhindert Pendeln: Abschaltung bei min_soc_aus, Freigabe erst wieder bei min_soc_ein
+- Netz als zusätzliches Schaltsignal: Einspeisung → hochschalten, Bezug → runterschalten
+- SOC-Fehler: kein Hochschalten außer bei bestätigter Netzeinspeisung > Schwelle
 """
 
 import time
@@ -20,7 +19,7 @@ import requests
 import yaml
 from flask import Flask, jsonify, render_template_string
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,14 +79,15 @@ else:
 log.info(f"Heizstab-Modus: {HEIZSTAB_MODUS}, Shellys: {HEIZSTAB_SHELLYS}")
 
 R = CFG["regelparameter"]
-MIN_SOC                 = int(R["min_soc"])
+MIN_SOC_AUS             = int(R["min_soc_aus"])
+MIN_SOC_EIN             = int(R["min_soc_ein"])
 HOCHSCHALTEN_SCHWELLE   = int(R["hochschalten_schwelle"])
 RUNTERSCHALTEN_SCHWELLE = int(R["runterschalten_schwelle"])
 DELAY                   = int(R["delay"])
 POLL_INTERVAL           = int(R.get("poll_intervall", 5))
 SOC_CACHE_MAX           = int(R.get("soc_cache_max", 60))
 
-log.info(f"Regelparameter: min_soc={MIN_SOC}% hoch={HOCHSCHALTEN_SCHWELLE}W runter={RUNTERSCHALTEN_SCHWELLE}W delay={DELAY}s")
+log.info(f"Regelparameter: min_soc_aus={MIN_SOC_AUS}% min_soc_ein={MIN_SOC_EIN}% hoch={HOCHSCHALTEN_SCHWELLE}W runter={RUNTERSCHALTEN_SCHWELLE}W delay={DELAY}s")
 
 # ─── HEIZSTAB-KOMBINATIONEN ─────────────────────────────────────────────────
 
@@ -195,6 +195,7 @@ _state = {
     "relais":         [False] * ANZAHL_RELAIS,
     "hausverbrauch":  None,
     "thermostat_aus": False,
+    "soc_sperre":     False,
     "regeltext":      "Starte...",
     "regeltyp":       "info",
     "timestamp":      0,
@@ -205,6 +206,7 @@ _soc_cache       = None
 _soc_cache_zeit  = 0
 _regel_stufe     = 0
 _letzter_wechsel = 0
+_soc_sperre      = False   # True: SOC unter min_soc_aus; Freigabe erst bei min_soc_ein
 
 # ─── GERÄTE-ZUGRIFF ─────────────────────────────────────────────────────────
 
@@ -284,27 +286,54 @@ def setze_kombination(neue_stufe, alte_stufe):
 
 # ─── REGELLOGIK ─────────────────────────────────────────────────────────────
 
-def bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok):
+def bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok, soc_sperre):
     if pv is None or marstek is None:
         return "Messfehler – Gerät nicht erreichbar", "error"
-    if soc is not None and soc < MIN_SOC and stufe > 0:
-        return f"Ladestand {soc} % < Minimum {MIN_SOC} % – schalte stufenweise ab", "blocked"
+
+    netz_einspeisung = netz is not None and netz < -HOCHSCHALTEN_SCHWELLE
+    netz_bezug       = netz is not None and netz > RUNTERSCHALTEN_SCHWELLE
+
+    # SOC-Sperre aktiv (SOC bekannt aber zu niedrig, warte auf min_soc_ein)
+    if soc_sperre:
+        if netz_einspeisung:
+            return f"SOC-Sperre ({soc}% < {MIN_SOC_EIN}%) – Hochschalten via Einspeisung {abs(netz)} W möglich", "ready"
+        return f"SOC-Sperre aktiv ({soc}% < {MIN_SOC_EIN}%) – warte auf Freigabe", "blocked"
+
+    # SOC unbekannt – kein Hochschalten außer via Netzeinspeisung
+    if soc is None:
+        if netz_einspeisung:
+            return f"SOC unbekannt – Hochschalten via Netzeinspeisung {abs(netz)} W", "ready"
+        return "SOC unbekannt – kein Hochschalten bis Netzeinspeisung bestätigt", "blocked"
+
+    if stufe > 0 and soc < MIN_SOC_AUS:
+        return f"Ladestand {soc}% < {MIN_SOC_AUS}% – schalte stufenweise ab", "blocked"
     if not delay_ok:
         return "Wartezeit zwischen Schaltvorgängen läuft", "waiting"
     if stufe == ANZAHL_STUFEN:
         return f"Maximalstufe {STUFEN[stufe][0]} W aktiv", "max"
-    ueberschuss_signal = (marstek > HOCHSCHALTEN_SCHWELLE) or (netz is not None and netz < -HOCHSCHALTEN_SCHWELLE)
-    if ueberschuss_signal and (soc is None or soc >= MIN_SOC):
-        grund = f"Batterie lädt {marstek} W" if marstek > HOCHSCHALTEN_SCHWELLE else f"Einspeisung {abs(netz)} W"
-        return f"{grund} > {HOCHSCHALTEN_SCHWELLE} W – Hochschalten möglich", "ready"
-    if stufe > 0 and marstek < -RUNTERSCHALTEN_SCHWELLE:
-        return f"Batterie entlädt {abs(marstek)} W > {RUNTERSCHALTEN_SCHWELLE} W – Runterschalten", "down"
+
+    marstek_hoch = marstek > HOCHSCHALTEN_SCHWELLE
+    marstek_runt = marstek < -RUNTERSCHALTEN_SCHWELLE
+
+    if (marstek_hoch or netz_einspeisung) and soc >= MIN_SOC_EIN:
+        teile = []
+        if marstek_hoch:    teile.append(f"Batterie lädt {marstek} W")
+        if netz_einspeisung: teile.append(f"Einspeisung {abs(netz)} W")
+        return " + ".join(teile) + f" > {HOCHSCHALTEN_SCHWELLE} W – Hochschalten", "ready"
+
+    if stufe > 0 and (marstek_runt or netz_bezug):
+        teile = []
+        if marstek_runt: teile.append(f"Batterie entlädt {abs(marstek)} W")
+        if netz_bezug:   teile.append(f"Netzbezug {netz} W")
+        return " + ".join(teile) + f" > {RUNTERSCHALTEN_SCHWELLE} W – Runterschalten", "down"
+
     if marstek > 0:
         return f"Batterie lädt {marstek} W – noch {HOCHSCHALTEN_SCHWELLE - marstek} W bis Hochschalten", "waiting"
     return "Kein Überschuss – Heizstab hält Stufe", "holding"
 
+
 def regelschleife():
-    global _regel_stufe, _letzter_wechsel
+    global _regel_stufe, _letzter_wechsel, _soc_sperre
     log.info(f"myhems v{VERSION} – Standort {STANDORT_NAME} gestartet")
     for r in range(ANZAHL_RELAIS):
         setze_relais(r, False)
@@ -320,6 +349,15 @@ def regelschleife():
             now     = time.time()
             delay_ok = (now - _letzter_wechsel) >= DELAY
 
+            # ── SOC-Hysterese-Sperre aktualisieren ──────────────────────────
+            if soc is not None:
+                if not _soc_sperre and soc < MIN_SOC_AUS:
+                    _soc_sperre = True
+                    log.info(f"🔒 SOC-Sperre gesetzt: {soc}% < {MIN_SOC_AUS}%")
+                elif _soc_sperre and soc >= MIN_SOC_EIN:
+                    _soc_sperre = False
+                    log.info(f"🔓 SOC-Sperre aufgehoben: {soc}% >= {MIN_SOC_EIN}%")
+
             hausverbrauch = None
             if pv is not None and netz is not None and marstek is not None:
                 hausverbrauch = round(pv + netz - marstek)
@@ -329,7 +367,7 @@ def regelschleife():
                 if hausverbrauch < THERMOSTAT_SCHWELLE.get(stufe, 0):
                     thermostat_aus = True
 
-            regeltext, regeltyp = bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok)
+            regeltext, regeltyp = bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok, _soc_sperre)
 
             akkumuliere_energie(pv, netz)
 
@@ -344,6 +382,7 @@ def regelschleife():
                     "relais":         list(STUFEN[stufe][1]),
                     "hausverbrauch":  hausverbrauch,
                     "thermostat_aus": thermostat_aus,
+                    "soc_sperre":     _soc_sperre,
                     "regeltext":      regeltext,
                     "regeltyp":       regeltyp,
                     "timestamp":      int(now),
@@ -358,31 +397,51 @@ def regelschleife():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # SOC-Schutz: stufenweise abschalten mit delay
-            if stufe > 0 and soc is not None and soc < MIN_SOC:
+            # ── SOC-Schutz: stufenweise abschalten ──────────────────────────
+            if stufe > 0 and soc is not None and soc < MIN_SOC_AUS:
                 neu = stufe - 1
-                log.info(f"🔋 SOC {soc}% < {MIN_SOC}% – Stufe {stufe}→{neu} ({STUFEN[neu][0]}W)")
+                log.info(f"🔋 SOC {soc}% < {MIN_SOC_AUS}% – Stufe {stufe}→{neu} ({STUFEN[neu][0]}W)")
                 if setze_kombination(neu, stufe):
                     _regel_stufe = neu
                     _letzter_wechsel = now
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            ueberschuss_signal = (marstek > HOCHSCHALTEN_SCHWELLE) or (netz is not None and netz < -HOCHSCHALTEN_SCHWELLE)
+            # ── Hochschalten-Signal ──────────────────────────────────────────
+            marstek_hoch     = marstek > HOCHSCHALTEN_SCHWELLE
+            netz_einspeisung = netz is not None and netz < -HOCHSCHALTEN_SCHWELLE
 
-            if stufe < ANZAHL_STUFEN and ueberschuss_signal and (soc is None or soc >= MIN_SOC):
+            if soc is None or _soc_sperre:
+                # Kein SOC oder Sperre: nur Netzeinspeisung als Signal
+                hoch_signal = netz_einspeisung
+            else:
+                hoch_signal = (marstek_hoch or netz_einspeisung) and soc >= MIN_SOC_EIN
+
+            # ── Runterschalten-Signal ────────────────────────────────────────
+            marstek_runt = marstek < -RUNTERSCHALTEN_SCHWELLE
+            netz_bezug   = netz is not None and netz > RUNTERSCHALTEN_SCHWELLE
+            runt_signal  = marstek_runt or netz_bezug
+
+            if stufe < ANZAHL_STUFEN and hoch_signal:
                 neu = stufe + 1
-                grund = f"Marstek lädt {marstek}W" if marstek > HOCHSCHALTEN_SCHWELLE else f"Einspeisung {abs(netz)}W"
-                log.info(f"▲ Kombination {stufe}→{neu} ({STUFEN[neu][0]}W): {grund}")
+                teile = []
+                if marstek_hoch and not (soc is None or _soc_sperre):
+                    teile.append(f"Marstek {marstek}W")
+                if netz_einspeisung:
+                    teile.append(f"Einspeisung {abs(netz)}W")
+                log.info(f"▲ Stufe {stufe}→{neu} ({STUFEN[neu][0]}W): {' + '.join(teile)}")
                 if setze_kombination(neu, stufe):
                     _regel_stufe = neu
                     _letzter_wechsel = now
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            if stufe > 0 and marstek < -RUNTERSCHALTEN_SCHWELLE:
+            if stufe > 0 and runt_signal:
                 neu = stufe - 1
-                log.info(f"▼ Kombination {stufe}→{neu} ({STUFEN[neu][0]}W): Marstek entlädt {abs(marstek)}W")
+                teile = []
+                if marstek_runt: teile.append(f"Marstek entlädt {abs(marstek)}W")
+                if netz_bezug:   teile.append(f"Netzbezug {netz}W")
+                log.info(f"▼ Stufe {stufe}→{neu} ({STUFEN[neu][0]}W): {' + '.join(teile)}")
                 if setze_kombination(neu, stufe):
                     _regel_stufe = neu
                     _letzter_wechsel = now
@@ -406,7 +465,8 @@ def api_status():
     state["stufen"]          = [(w, m) for w, m in STUFEN]
     state["tagesenergie"]    = hole_tagesenergie()
     state["params"] = {
-        "MIN_SOC":                  MIN_SOC,
+        "MIN_SOC_AUS":              MIN_SOC_AUS,
+        "MIN_SOC_EIN":              MIN_SOC_EIN,
         "HOCHSCHALTEN_SCHWELLE":    HOCHSCHALTEN_SCHWELLE,
         "RUNTERSCHALTEN_SCHWELLE":  RUNTERSCHALTEN_SCHWELLE,
         "DELAY":                    DELAY,
@@ -504,6 +564,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="twarn-dot"></div>
       <div class="syn" style="font-size:7px;color:#f87171;letter-spacing:1px;">THERMOSTAT HAT HEIZSTAB ABGESCHALTET</div>
     </div>
+    <div class="twarn" id="socwarn" style="display:none;">
+      <div class="twarn-dot"></div>
+      <div class="syn" style="font-size:7px;color:#f87171;letter-spacing:1px;">SOC-SPERRE AKTIV – WARTE AUF FREIGABE</div>
+    </div>
     <div style="display:flex;justify-content:space-between;align-items:center;">
       <div>
         <div class="syn lbl">HEIZSTAB</div>
@@ -521,9 +585,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div style="background:var(--bg);border-radius:3px;height:12px;overflow:hidden;position:relative;">
       <div id="socBar" style="height:100%;border-radius:3px;transition:width .5s,background .5s;width:0%;"></div>
-      <div style="position:absolute;top:0;left:{{ min_soc }}%;width:1px;height:100%;background:var(--orange);"></div>
+      <div style="position:absolute;top:0;width:1px;height:100%;background:var(--red);left:{{ min_soc_aus }}%;"></div>
+      <div style="position:absolute;top:0;width:1px;height:100%;background:var(--orange);left:{{ min_soc_ein }}%;"></div>
     </div>
-    <div class="syn" style="font-size:7px;color:var(--dim);margin-top:4px;letter-spacing:2px;">MINDESTWERT {{ min_soc }} %</div>
+    <div style="display:flex;gap:16px;margin-top:4px;">
+      <div class="syn" style="font-size:7px;color:var(--red);letter-spacing:2px;">AUS {{ min_soc_aus }} %</div>
+      <div class="syn" style="font-size:7px;color:var(--orange);letter-spacing:2px;">EIN {{ min_soc_ein }} %</div>
+    </div>
   </div>
 
   <div class="grid">
@@ -621,10 +689,12 @@ async function update(){
     document.getElementById("heizSub").textContent = w>0 ? aktiv+" RELAIS AKTIV" : "KEIN HEIZSTAB";
     baueRelaisDots(d.relais_leistung || [], relais);
     document.getElementById("twarn").style.display = d.thermostat_aus ? "flex" : "none";
+    document.getElementById("socwarn").style.display = d.soc_sperre ? "flex" : "none";
     const soc = d.soc;
+    const p = d.params;
     const sc=document.getElementById("socVal"), sb=document.getElementById("socBar");
     if(soc!=null){
-      const c=soc<30?"#ef4444":soc<60?"#f59e0b":"#22c55e";
+      const c=soc<p.MIN_SOC_AUS?"#ef4444":soc<p.MIN_SOC_EIN?"#f59e0b":"#22c55e";
       sc.textContent=Math.round(soc)+" %";sc.style.color=c;
       sb.style.width=soc+"%";sb.style.background=c;
     } else {sc.textContent="n/v";sc.style.color="#4b5563";sb.style.width="0%";}
@@ -640,11 +710,14 @@ async function update(){
     document.getElementById("netzSub").textContent=n<0?"EINSPEISUNG":n>0?"NETZBEZUG":"AUSGEGLICHEN";
     document.getElementById("netzSub").style.color=nc;
     document.getElementById("eigenVal").textContent=fmtAbs(d.hausverbrauch);
-    const p=d.params;
-    bed("bedSOC",d.soc==null||d.soc>=p.MIN_SOC,"LADESTAND ≥ "+p.MIN_SOC+" %",d.soc!=null?Math.round(d.soc)+" %":"n/v");
-    bed("bedHoch",(d.marstek||0)>p.HOCHSCHALTEN_SCHWELLE||(d.netz||0)<-p.HOCHSCHALTEN_SCHWELLE,
+    const socOk = soc!=null && !d.soc_sperre && soc>=p.MIN_SOC_EIN;
+    bed("bedSOC", socOk,
+      "LADESTAND  AUS ≥"+p.MIN_SOC_AUS+"% / EIN ≥"+p.MIN_SOC_EIN+"%",
+      soc!=null ? Math.round(soc)+"%" : "n/v");
+    const ueberschuss = (d.marstek||0)>p.HOCHSCHALTEN_SCHWELLE || (d.netz||0)<-p.HOCHSCHALTEN_SCHWELLE;
+    bed("bedHoch", ueberschuss,
       "ÜBERSCHUSS > "+p.HOCHSCHALTEN_SCHWELLE.toLocaleString("de-DE")+" W",
-      fmt(d.marstek));
+      ueberschuss ? ((d.marstek||0)>p.HOCHSCHALTEN_SCHWELLE ? fmt(d.marstek) : fmt(d.netz)) : "—");
     const rt=document.getElementById("regeltext");
     rt.textContent=d.regeltext; rt.className="regeltext "+(d.regeltyp||"");
     document.getElementById("ts").textContent="LETZTE AKTUALISIERUNG · "+new Date(d.timestamp*1000).toLocaleTimeString("de-DE");
@@ -673,7 +746,8 @@ update(); setInterval(update,5000);
 def dashboard():
     return render_template_string(DASHBOARD_HTML,
         standort=STANDORT_NAME,
-        min_soc=MIN_SOC,
+        min_soc_aus=MIN_SOC_AUS,
+        min_soc_ein=MIN_SOC_EIN,
     )
 
 if __name__ == "__main__":
