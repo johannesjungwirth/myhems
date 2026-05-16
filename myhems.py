@@ -280,7 +280,7 @@ def _plenticore_read_float(addr):
     try:
         c = _ModbusTcpClient(PLENTICORE_IP, port=PLENTICORE_PORT)
         c.connect()
-        r = c.read_holding_registers(address=addr, count=2, slave=PLENTICORE_SLAVE)
+        r = c.read_holding_registers(address=addr, count=2, device_id=PLENTICORE_SLAVE)
         c.close()
         if r.isError():
             return None
@@ -445,8 +445,8 @@ def regelschleife():
                     log.info(f"🔓 SOC-Sperre aufgehoben: {soc}% >= {MIN_SOC_EIN}%")
 
             hausverbrauch = None
-            if pv is not None and netz is not None and marstek is not None:
-                hausverbrauch = round(pv + netz - marstek)
+            if pv is not None and netz is not None:
+                hausverbrauch = round(pv + netz - (marstek or 0))
 
             thermostat_aus = False
             if stufe > 0 and hausverbrauch is not None:
