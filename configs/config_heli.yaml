@@ -1,0 +1,44 @@
+standort:
+  name: Heli
+  domain: heli.myhems.org
+
+geraete:
+  # Plenticore Wechselrichter (Modbus TCP)
+  plenticore_ip:   "192.168.178.77"
+  plenticore_port: 1502
+  plenticore_slave: 71
+
+  # Shelly Pro 3EM – WP-Verbrauch (noch nicht in Regellogik)
+  shelly_wp:
+    ip: "192.168.178.175"
+    typ: "EM"
+
+  # Shelly Plus Uni – SG-Ready (noch nicht aktiv)
+  shelly_sgready:  "192.168.178.171"
+
+  # Shelly The Pill – Pufferspeicher Temperaturen
+  shelly_pill:     "192.168.178.172"
+
+  # Kein Marstek verbaut (noch)
+  marstek_ip:      null
+  marstek_port:    30000
+
+  # Kein Heizstab
+  shelly_heizstab: null
+
+# Datenquellen konfigurieren
+quellen:
+  pv:   "plenticore"   # Alternativen: "shelly"
+  netz: "plenticore"   # Alternativen: "shelly"
+
+heizstab:
+  relais: []   # Kein Heizstab bei Heli
+
+regelparameter:
+  min_soc_aus:             80
+  min_soc_ein:             85
+  hochschalten_schwelle:   500
+  runterschalten_schwelle: 500
+  delay:                   60
+  poll_intervall:          10
+  soc_cache_max:           60

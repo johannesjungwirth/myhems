@@ -1,5 +1,14 @@
 # myhems Changelog
 
+## v0.9.0 (Mai 2026)
+- Plenticore Modbus TCP Adapter (Register 252=Netz, 260/270=PV String1/2)
+- Monitoring-Only Modus: wenn marstek_ip=null in Config → keine Schaltlogik
+- Datenquellen konfigurierbar: quellen.pv / quellen.netz ("shelly" oder "plenticore")
+- config_heli.yaml: neuer Standort Heli (WP, Plenticore 9kWp, kein Marstek/Heizstab)
+- Heizstab relais: [] wird korrekt behandelt (leere Kombinationsliste)
+- SHELLY_PV/NETZ/MARSTEK optional wenn Quelle = Plenticore oder MONITORING_ONLY
+- pymodbus Import mit graceful Fallback wenn nicht installiert
+
 ## v0.8.0 (Mai 2026)
 - min_soc aufgeteilt in min_soc_aus / min_soc_ein (Hysterese, ~5% Gap)
   - Abschalten wenn SOC < min_soc_aus, Freigabe erst wieder bei SOC >= min_soc_ein
@@ -36,6 +45,9 @@
 - Aktueller Stand auf hemsbox-udo
 
 ## Offene TODOs
+- [ ] Heli: AC Gesamtleistung Register verifizieren (morgen bei Sonnenschein testen)
+- [ ] Heli: Marstek Venus E nachrüsten und einbinden
+- [ ] Heli: Wärmepumpen-Steuerung via SG-Ready implementieren
 - [ ] Responsive Dashboard Layout (CSS media queries für PC-Browser)
 - [ ] App-Icon PNG (192×192, 512×512)
 - [ ] Muddl: Cloudflare Tunnel

@@ -17,9 +17,18 @@ from datetime import date, timedelta
 from itertools import combinations as iter_combinations
 import requests
 import yaml
+import struct
 from flask import Flask, jsonify, render_template_string
 
-VERSION = "0.8.0"
+try:
+    from pymodbus.client import ModbusTcpClient as _ModbusTcpClient
+    MODBUS_VERFUEGBAR = True
+except ImportError:
+    MODBUS_VERFUEGBAR = False
+    log_pre = logging.getLogger("myhems")
+    log_pre.warning("pymodbus nicht installiert – Plenticore-Adapter nicht verfügbar")
+
+VERSION = "0.9.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,24 +60,37 @@ CFG = lade_config()
 
 STANDORT_NAME   = CFG["standort"]["name"]
 G               = CFG["geraete"]
-MARSTEK_IP      = G["marstek_ip"]
-MARSTEK_PORT    = int(G.get("marstek_port", 30000))
+
 
 def parse_shelly(cfg, default_typ="EM"):
     if isinstance(cfg, str):
         return cfg, default_typ
     return cfg["ip"], cfg.get("typ", default_typ)
 
-SHELLY_PV_IP,      SHELLY_PV_TYP      = parse_shelly(G["shelly_pv"],      "EM")
-SHELLY_NETZ_IP,    SHELLY_NETZ_TYP    = parse_shelly(G["shelly_netz"],    "EM")
-SHELLY_MARSTEK_IP, SHELLY_MARSTEK_TYP = parse_shelly(G["shelly_marstek"], "Switch")
+if QUELLE_PV == "shelly":
+    SHELLY_PV_IP, SHELLY_PV_TYP = parse_shelly(G["shelly_pv"], "EM")
+else:
+    SHELLY_PV_IP, SHELLY_PV_TYP = None, None
 
-log.info(f"PV:     {SHELLY_PV_IP} typ={SHELLY_PV_TYP}")
-log.info(f"Netz:   {SHELLY_NETZ_IP} typ={SHELLY_NETZ_TYP}")
-log.info(f"Marstek:{SHELLY_MARSTEK_IP} typ={SHELLY_MARSTEK_TYP}")
+if QUELLE_NETZ == "shelly":
+    SHELLY_NETZ_IP, SHELLY_NETZ_TYP = parse_shelly(G["shelly_netz"], "EM")
+else:
+    SHELLY_NETZ_IP, SHELLY_NETZ_TYP = None, None
 
-_heizstab_cfg = G["shelly_heizstab"]
-if isinstance(_heizstab_cfg, (str, dict)):
+if not MONITORING_ONLY:
+    SHELLY_MARSTEK_IP, SHELLY_MARSTEK_TYP = parse_shelly(G["shelly_marstek"], "Switch")
+else:
+    SHELLY_MARSTEK_IP, SHELLY_MARSTEK_TYP = None, None
+
+log.info(f"PV:     {SHELLY_PV_IP or 'Plenticore'}")
+log.info(f"Netz:   {SHELLY_NETZ_IP or 'Plenticore'}")
+log.info(f"Marstek:{SHELLY_MARSTEK_IP or 'nicht konfiguriert'}")
+
+_heizstab_cfg = G.get("shelly_heizstab")
+if _heizstab_cfg is None:
+    HEIZSTAB_MODUS   = "none"
+    HEIZSTAB_SHELLYS = []
+elif isinstance(_heizstab_cfg, (str, dict)):
     HEIZSTAB_MODUS   = "single"
     ip, _ = parse_shelly(_heizstab_cfg, "Switch")
     HEIZSTAB_SHELLYS = [ip]
@@ -77,6 +99,24 @@ else:
     HEIZSTAB_SHELLYS = [parse_shelly(e, "Switch")[0] for e in _heizstab_cfg]
 
 log.info(f"Heizstab-Modus: {HEIZSTAB_MODUS}, Shellys: {HEIZSTAB_SHELLYS}")
+
+# Plenticore Konfiguration
+PLENTICORE_IP    = G.get("plenticore_ip")
+PLENTICORE_PORT  = int(G.get("plenticore_port", 1502))
+PLENTICORE_SLAVE = int(G.get("plenticore_slave", 71))
+
+# Datenquellen
+_quellen = CFG.get("quellen", {})
+QUELLE_PV   = _quellen.get("pv",   "shelly")
+QUELLE_NETZ = _quellen.get("netz", "shelly")
+
+# Marstek optional
+MARSTEK_IP   = G.get("marstek_ip")
+MARSTEK_PORT = int(G.get("marstek_port", 30000)) if G.get("marstek_port") else 30000
+MONITORING_ONLY = MARSTEK_IP is None
+
+if MONITORING_ONLY:
+    log.info("Modus: MONITORING ONLY – keine Schaltlogik (kein Marstek konfiguriert)")
 
 R = CFG["regelparameter"]
 MIN_SOC_AUS             = int(R["min_soc_aus"])
@@ -110,13 +150,17 @@ def berechne_kombinationen(relais_leistung):
     result = [(0, [False] * n)] + [(w, m) for w, m in sortiert]
     return result
 
-STUFEN = berechne_kombinationen(RELAIS_LEISTUNG)
-ANZAHL_STUFEN = len(STUFEN) - 1
-
-log.info(f"Heizstab: {ANZAHL_RELAIS} Relais {RELAIS_LEISTUNG}W → {ANZAHL_STUFEN} Kombinationen")
-for i, (w, m) in enumerate(STUFEN):
-    relais_an = [j+1 for j, on in enumerate(m) if on]
-    log.info(f"  Kombination {i}: {w}W – Relais {relais_an}")
+if ANZAHL_RELAIS == 0:
+    STUFEN        = [(0, [])]
+    ANZAHL_STUFEN = 0
+    log.info("Heizstab: nicht konfiguriert (Monitoring-Modus)")
+else:
+    STUFEN = berechne_kombinationen(RELAIS_LEISTUNG)
+    ANZAHL_STUFEN = len(STUFEN) - 1
+    log.info(f"Heizstab: {ANZAHL_RELAIS} Relais {RELAIS_LEISTUNG}W → {ANZAHL_STUFEN} Kombinationen")
+    for i, (w, m) in enumerate(STUFEN):
+        relais_an = [j+1 for j, on in enumerate(m) if on]
+        log.info(f"  Kombination {i}: {w}W – Relais {relais_an}")
 
 THERMOSTAT_SCHWELLE = {i: STUFEN[i][0] // 2 for i in range(1, len(STUFEN))}
 
@@ -227,12 +271,50 @@ def lese_em_leistung(ip, typ):
         data = shelly_get(ip, "/rpc/EM.GetStatus?id=0")
         return round(data.get("total_act_power", 0)) if data else None
 
+# ─── PLENTICORE ADAPTER ──────────────────────────────────────────────────────
+
+def _plenticore_read_float(addr):
+    """Liest einen float32 Little-Endian Wert vom Plenticore."""
+    if not MODBUS_VERFUEGBAR or not PLENTICORE_IP:
+        return None
+    try:
+        c = _ModbusTcpClient(PLENTICORE_IP, port=PLENTICORE_PORT)
+        c.connect()
+        r = c.read_holding_registers(address=addr, count=2, slave=PLENTICORE_SLAVE)
+        c.close()
+        if r.isError():
+            return None
+        return struct.unpack('<f', struct.pack('<HH', r.registers[0], r.registers[1]))[0]
+    except Exception as e:
+        log.warning(f"Plenticore {PLENTICORE_IP} Fehler addr={addr}: {e}")
+        return None
+
+def lese_pv_plenticore():
+    """PV-Leistung: String1 + String2 DC (Register 260+270). Morgen AC testen."""
+    s1 = _plenticore_read_float(260)
+    s2 = _plenticore_read_float(270)
+    if s1 is None and s2 is None:
+        return None
+    return round((s1 or 0) + (s2 or 0))
+
+def lese_netz_plenticore():
+    """Netzbezug/Einspeisung (Register 252). Negativ=Einspeisung, Positiv=Bezug."""
+    val = _plenticore_read_float(252)
+    return round(val) if val is not None else None
+
 def lese_pv():
-    w = lese_em_leistung(SHELLY_PV_IP, SHELLY_PV_TYP)
-    return round(abs(w)) if w is not None else None
+    if QUELLE_PV == "plenticore":
+        w = lese_pv_plenticore()
+        return round(abs(w)) if w is not None else None
+    else:
+        w = lese_em_leistung(SHELLY_PV_IP, SHELLY_PV_TYP)
+        return round(abs(w)) if w is not None else None
 
 def lese_netz():
-    return lese_em_leistung(SHELLY_NETZ_IP, SHELLY_NETZ_TYP)
+    if QUELLE_NETZ == "plenticore":
+        return lese_netz_plenticore()
+    else:
+        return lese_em_leistung(SHELLY_NETZ_IP, SHELLY_NETZ_TYP)
 
 def lese_marstek_leistung():
     data = shelly_get(SHELLY_MARSTEK_IP, "/rpc/Switch.GetStatus?id=0")
@@ -335,16 +417,20 @@ def bestimme_regeltext(pv, marstek, netz, soc, stufe, delay_ok, soc_sperre):
 def regelschleife():
     global _regel_stufe, _letzter_wechsel, _soc_sperre
     log.info(f"myhems v{VERSION} – Standort {STANDORT_NAME} gestartet")
-    for r in range(ANZAHL_RELAIS):
-        setze_relais(r, False)
-    log.info("Alle Relais beim Start ausgeschaltet")
+
+    if not MONITORING_ONLY:
+        for r in range(ANZAHL_RELAIS):
+            setze_relais(r, False)
+        log.info("Alle Relais beim Start ausgeschaltet")
+    else:
+        log.info("Monitoring-Modus: Relais werden nicht geschaltet")
 
     while True:
         try:
             pv      = lese_pv()
             netz    = lese_netz()
-            marstek = lese_marstek_leistung()
-            soc     = lese_marstek_soc()
+            marstek = lese_marstek_leistung() if not MONITORING_ONLY else None
+            soc     = lese_marstek_soc()      if not MONITORING_ONLY else None
             stufe   = _regel_stufe
             now     = time.time()
             delay_ok = (now - _letzter_wechsel) >= DELAY
@@ -388,8 +474,12 @@ def regelschleife():
                     "timestamp":      int(now),
                 })
 
-            if any(v is None for v in [pv, marstek]):
+            if any(v is None for v in [pv, marstek]) and not MONITORING_ONLY:
                 log.warning("Messwerte unvollständig – überspringe Regelzyklus")
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if MONITORING_ONLY:
                 time.sleep(POLL_INTERVAL)
                 continue
 
