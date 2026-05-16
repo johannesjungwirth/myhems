@@ -67,6 +67,24 @@ def parse_shelly(cfg, default_typ="EM"):
         return cfg, default_typ
     return cfg["ip"], cfg.get("typ", default_typ)
 
+# Plenticore Konfiguration
+PLENTICORE_IP    = G.get("plenticore_ip")
+PLENTICORE_PORT  = int(G.get("plenticore_port", 1502))
+PLENTICORE_SLAVE = int(G.get("plenticore_slave", 71))
+
+# Datenquellen
+_quellen = CFG.get("quellen", {})
+QUELLE_PV   = _quellen.get("pv",   "shelly")
+QUELLE_NETZ = _quellen.get("netz", "shelly")
+
+# Marstek optional
+MARSTEK_IP      = G.get("marstek_ip")
+MARSTEK_PORT    = int(G.get("marstek_port", 30000)) if G.get("marstek_port") else 30000
+MONITORING_ONLY = MARSTEK_IP is None
+
+if MONITORING_ONLY:
+    log.info("Modus: MONITORING ONLY – keine Schaltlogik (kein Marstek konfiguriert)")
+
 if QUELLE_PV == "shelly":
     SHELLY_PV_IP, SHELLY_PV_TYP = parse_shelly(G["shelly_pv"], "EM")
 else:
@@ -99,24 +117,6 @@ else:
     HEIZSTAB_SHELLYS = [parse_shelly(e, "Switch")[0] for e in _heizstab_cfg]
 
 log.info(f"Heizstab-Modus: {HEIZSTAB_MODUS}, Shellys: {HEIZSTAB_SHELLYS}")
-
-# Plenticore Konfiguration
-PLENTICORE_IP    = G.get("plenticore_ip")
-PLENTICORE_PORT  = int(G.get("plenticore_port", 1502))
-PLENTICORE_SLAVE = int(G.get("plenticore_slave", 71))
-
-# Datenquellen
-_quellen = CFG.get("quellen", {})
-QUELLE_PV   = _quellen.get("pv",   "shelly")
-QUELLE_NETZ = _quellen.get("netz", "shelly")
-
-# Marstek optional
-MARSTEK_IP   = G.get("marstek_ip")
-MARSTEK_PORT = int(G.get("marstek_port", 30000)) if G.get("marstek_port") else 30000
-MONITORING_ONLY = MARSTEK_IP is None
-
-if MONITORING_ONLY:
-    log.info("Modus: MONITORING ONLY – keine Schaltlogik (kein Marstek konfiguriert)")
 
 R = CFG["regelparameter"]
 MIN_SOC_AUS             = int(R["min_soc_aus"])
